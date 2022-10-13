@@ -1,0 +1,146 @@
+# count number of patients that acquired potential DRM
+# get list of DRM
+# for each DRM, get dataset, count 
+
+
+#x out of y individuals had the mutation before starting treatment. after treatment: xx
+#z out of y indiviuals did not have the mutations before starting treatment, but had the mutation after treatment
+
+# _v2 second version is going to focus only on the aa mutants I am interested in
+
+library(ape)
+library(phangorn)
+library(bioseq)
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(gtools)
+
+runDate <- "April12"
+ndays <- 10
+subdir <- paste0(ndays,"daycutoff")
+
+#rootDir <- paste0("C:/Users/mr909/OneDrive/Projects/ncov/PHE/therapeutics/", runDate)
+#refDir <- "C:/Users/mr909/OneDrive/Projects/ncov/PHE/therapeutics/reference/"
+
+rootDir <- paste0("C:/Users/manon.ragonnet/Documents/Projects/therapeutics/", runDate)
+refDir <- "C:/Users/manon.ragonnet/Documents/Projects/therapeutics/reference/"
+
+wDir <- paste0(rootDir, "/",subdir)
+setwd(wDir)
+
+# read in significant mutations file
+mutFile <- dir()[grep("significant_AA_changes_pre-post-treatment", dir())][grep("csv", dir()[grep("significant_AA_changes_pre-post-treatment", dir())])] # some numbers I can get from thsi dataframe directly and do nto need to be regenerated
+mut <- read.csv(mutFile, stringsAsFactors = F)
+#("significant_AA_changes_pre-post-treatment_Feb15b.csv")
+uniqueCombos <- unique(mut[c("gene", "variant", "treatment")])
+
+lineages<- read.csv("../therapeutics_with_seq_lineages.csv", stringsAsFactors = F)
+lineages <- rbind(lineages[lineages$prepost=="post" & lineages$date_difference>ndays,], lineages[lineages$prepost=="pre",])
+
+aa_files <- dir(rootDir)[grep("aa", dir(rootDir))]
+
+mut$switchestoThisAA<- "none" # how many individuals were WT before treatment, but had a mutation after?
+mut$prePostN <- "none"
+
+for (i in 1:length(uniqueCombos[,1])){
+  genename <- uniqueCombos$gene[i]
+  drug <- uniqueCombos$treatment[i]
+  var <- uniqueCombos$variant[i]
+  
+  print(paste(genename, drug, var))
+  
+  aafile <- aa_files[grep(paste0(genename, "\\."), aa_files)]
+  aa_seq <- bioseq::read_fasta(paste0(rootDir, "/",aafile), type="AA")
+  
+  names(aa_seq) <- gsub("\r", "", names(aa_seq))
+  aa_seq_uniqueID <- aa_seq[match(unique(names(aa_seq)),names(aa_seq))]
+  
+  seqNames <- lineages$central_sample_id[lineages$intervention==drug & lineages$variant ==var]
+  aa_subset <- aa_seq_uniqueID[match(seqNames,names(aa_seq_uniqueID))]
+  
+  # append pre/post info and unique patient ID and create tibble
+  fra_data <- tibble(label = names( aa_subset ), sequence =  aa_subset )
+  fra_data$treatment <- "unknown"
+  
+  fra_data$treatment[match(lineages$central_sample_id[lineages$prepost=="post"], fra_data$label)] <- "post"
+  fra_data$treatment[match(lineages$central_sample_id[lineages$prepost=="pre"], fra_data$label)] <- "pre"
+  
+  fra_data$uniqueID <- lineages$uniq_ID[match(fra_data$label, lineages$central_sample_id)]
+  
+  # what mutations do I want to look at
+  mut2 <- mut[mut$treatment==drug & mut$gene==genename & mut$variant==var,]
+  residues <- unique(mut2$pos)
+  
+  for (res in residues){
+    print(res)
+    mut3 <- mut2[mut2$pos==res,]
+    
+    aa2b <- unlist(lapply(mut3$aminoacid, function(x) {strsplit(x,"\\d+")[[1]][2]})) # splits on the number
+    aa1 <- unique(unlist(lapply(mut3$aminoacid, function(x) {strsplit(x,"\\d+")[[1]][1]}))) # splits on the number
+    aa2 <- aa2b[-which(aa2b==aa1)]
+    
+    prepost <- table(fra_data$uniqueID, unlist(lapply(fra_data$sequence, function(x) {strsplit(x, "")[[1]][res]})),fra_data$treatment)
+    
+    pre <- as.data.frame.matrix(prepost[,,2]); pre$X <- NULL
+    pre$rowsum <- rowSums(pre[,1:length(pre[1,])])
+    pre2 <- pre[pre$rowsum>0,]; pre2$rowsum <- NULL
+    colnames(pre2) <- paste("pre_", colnames(pre2), sep="")
+    pre2$uniqueID <- rownames(pre2)
+    
+    post <- as.data.frame.matrix(prepost[,,1]); post$X <- NULL
+    post$rowsum <- rowSums(post[,1:length(post[1,])])
+    post2 <- post[post$rowsum>0,]; post2$rowsum <- NULL
+    colnames(post2) <- paste("post_", colnames(post2), sep="")
+    post2$uniqueID <- rownames(post2)
+    
+    prepost_merge <- merge(pre2, post2, by="uniqueID", all=F)
+    if (length(prepost_merge[,1])>0){
+      prepost_merge$preAA <- "unknown"
+      prepost_merge$postAA <- "unknown"
+  
+      
+      for (line in 1:length(prepost_merge[,1])){
+        print(line)
+        preCols <- grep("pre_", colnames(prepost_merge)); postCols <- grep("post_", colnames(prepost_merge))
+        thisPreCol <- which(prepost_merge[line,preCols]>0);   thisPostCol <- which(prepost_merge[line,postCols]>0)
+        prepost_merge$preAA[line] <- names(prepost_merge[preCols])[thisPreCol]
+        postAAtemp <- names(prepost_merge[postCols])[thisPostCol]
+        if(length(postAAtemp)>1){
+          postAAtemp2 <-unlist(lapply(postAAtemp, function(x) {strsplit(x, "_")[[1]][2]}))
+          preAAtemp2 <- strsplit(prepost_merge$preAA[line], "_")[[1]][2]
+          prepost_merge$postAA[line] <-paste0("post_", postAAtemp2[-which(postAAtemp2==preAAtemp2)])
+        } else {
+          prepost_merge$postAA[line] <- postAAtemp
+        }
+      }
+      prepost_merge$preAA <- gsub("pre_", "",  prepost_merge$preAA)
+      prepost_merge$postAA <- gsub("post_", "",  prepost_merge$postAA)
+      
+      # sav only the ones that are different pre and post
+      prepost_merge2 <- prepost_merge[prepost_merge$preAA != prepost_merge$postAA,]
+      
+      if(length(prepost_merge2[,1])){
+        
+        littledf <- as.data.frame(table(prepost_merge2$preAA, prepost_merge2$postAA), stringsAsFactors = F) 
+        
+        
+        names(littledf) <- c("pre", "post", "Freq")
+        
+        for (j in 1:length(littledf[,1])){
+          print(j)
+          #which lines in mut do I want to update
+          mutLines <- which(mut$treatment==drug & mut$gene==genename & mut$variant==var & mut$pos==res)
+          postAAs <- unlist(lapply(mut$aminoacid[mutLines], function(x) {strsplit(x, "\\d+")[[1]][2]}))
+          mut$switchestoThisAA[mutLines[which(postAAs==littledf$post[j])]] <- littledf$Freq[j]
+          mut$prePostN[mutLines[which(postAAs==littledf$post[j])]] <- length(prepost_merge[,1]) # not prepost_merge2 because those are only the ones that differ pre and post
+          
+        }
+      }
+    }
+  }
+}
+
+newFileName <- paste0(strsplit(mutFile, "\\.")[[1]][1], "_wSwitches.csv")
+
+write.csv(mut, newFileName, row.names=F)
